@@ -54,12 +54,9 @@ button.sec{background:#323843;color:var(--fg)}
     <label>Arpeggio step: <b id="v_arp">20</b> ms
       <input type="range" id="arp" min="6" max="50" value="20">
       <span class="hint">Faster = smoother chords, but buzzier. 16&ndash;25 is the classic sweet spot.</span></label>
-    <label>Buzzers in use: <b id="v_nbuz">1</b>
-      <input type="range" id="nbuz" min="1" max="1" value="1">
-      <span class="hint">Notes are spread over the buzzers; only extra notes share one by arpeggio.</span></label>
-    <label>Max notes in the arpeggio (per buzzer): <b id="v_maxn">4</b>
+    <label>Max notes in the arpeggio: <b id="v_maxn">4</b>
       <input type="range" id="maxn" min="1" max="6" value="4">
-      <span class="hint">1 = only the top note on each buzzer.</span></label>
+      <span class="hint">1 = melody (top voice) only.</span></label>
     <label>Lowest note: <b id="v_minn">48</b> (<span id="n_minn">C3</span>)
       <input type="range" id="minn" min="40" max="60" value="48">
       <span class="hint">Notes below this jump up whole octaves (tiny buzzers can't do bass).</span></label>
@@ -240,10 +237,9 @@ async function send(play){
 }
 
 // settings
-const cfgIds=['arp','maxn','minn','nbuz'],cfgChk=['boost','drums','dyn','loop'];
-let cfgT=0,cfgReady=false;
+const cfgIds=['arp','maxn','minn'],cfgChk=['boost','drums','dyn','loop'];
+let cfgT=0;
 function pushCfg(){
-  if(!cfgReady)return;
   const q=new URLSearchParams();
   cfgIds.forEach(i=>q.set(i,$(i).value));
   cfgChk.forEach(i=>q.set(i,$(i).checked?1:0));
@@ -274,14 +270,10 @@ async function poll(){
   try{
     const s=await (await fetch('/status')).json();
     cap=s.cap;playing=s.playing;
-    if(!cfgReady){   // adopt the board's buzzer count before we push any settings
-      $('nbuz').max=s.nbmax;$('nbuz').value=s.nb;$('v_nbuz').textContent=s.nb;
-      cfgReady=true;pushCfg();
-    }
     $('prog').style.width=(s.len?Math.min(100,100*s.pos/s.len):0)+'%';
     $('time').textContent=fmt(s.pos)+' / '+fmt(s.len);
     $('play').textContent=s.playing?'↺ Restart':'▶ Play';
   }catch(e){}
 }
-setInterval(poll,400);poll();
+setInterval(poll,400);poll();pushCfg();
 </script></body></html>)HTML";
