@@ -38,10 +38,10 @@
 #include <esp_timer.h>
 #include <driver/ledc.h>
 #include "index_html.h"
+#include "secrets.h"
 
 // ---------- configuration ----------
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+// WIFI_SSID / WIFI_PASS live in secrets.h (gitignored): copy secrets.example.h to secrets.h.
 // If the router can't be reached within WIFI_TIMEOUT_MS the board opens its own network.
 const char* AP_SSID = "MidiBuzzer";
 const char* AP_PASS = "buzzer123";
