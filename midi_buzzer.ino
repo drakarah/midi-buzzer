@@ -15,6 +15,11 @@
 //   * synthetic drums  - kick = pitch sweep, snare/hat/cymbal = noise bursts
 //   * dynamics         - velocity -> PWM duty (narrower pulse = quieter)
 //
+//   * channel priority - per channel (set on the web page): Background..Lead.
+//                        Priority decides who is "the melody" on a buzzer, how
+//                        many arpeggio slots a note gets (smooth weighted round
+//                        robin) and which notes get a buzzer to themselves.
+//                        Per-channel volume scales the PWM duty.
 //   * multi-buzzer     - with several buzzers (BUZZER_PINS) notes are spread
 //                        over them (sticky, least-loaded first); only when there
 //                        are more notes than buzzers do they share by arpeggio
@@ -65,6 +70,13 @@ volatile bool cfgDrums = true;
 volatile bool cfgDyn = false;
 volatile bool cfgLoop = false;
 
+// per-channel settings (set from the web page)
+volatile uint8_t chPri[16];      // 0 background, 1 normal, 2 high, 3 lead
+volatile uint8_t chVol[16];      // 10..100 (% of full PWM duty)
+void resetChannels() {
+  for (int c = 0; c < 16; c++) { chPri[c] = 1; chVol[c] = 100; }
+}
+
 // ---------- song ----------
 uint8_t* songBuf = nullptr;
 uint32_t songBytes = 0;
@@ -87,6 +99,7 @@ struct Voice {
   int8_t buz;                    // buzzer this voice lives on
   bool played;                   // has had its attack slot yet
   uint32_t on;
+  int acc;                       // weighted round-robin accumulator
 };
 Voice voices[MAX_VOICES];
 int nVoices = 0;
@@ -161,10 +174,24 @@ int foldNote(int n) {
 }
 
 // ---------- drums ----------
+// How busy a buzzer is: every note weighs 1 + its channel priority.
 int voicesOn(int b) {
   int n = 0;
-  for (int i = 0; i < nVoices; i++) n += voices[i].buz == b;
+  for (int i = 0; i < nVoices; i++)
+    if (voices[i].buz == b) n += 1 + chPri[voices[i].ch];
   return n;
+}
+
+// Volume -> PWM duty. The fundamental of a pulse train scales as sin(pi * duty), so to get a
+// real change in loudness the wanted amplitude is mapped back through asin().
+// The slider is perceptual (quadratic): 100% = full, 50% = -12 dB, 25% = -24 dB.
+int dutyFor(int ch, int vel) {
+  float v = chVol[ch] / 100.0f;
+  float g = v * v;
+  if (cfgDyn) g *= 0.3f + 0.7f * vel / 15.0f;
+  int d = (int)(asinf(g) / 3.14159265f * 1024.0f);
+  if (d > FULL_DUTY) d = FULL_DUTY;
+  return d < 4 ? 4 : d;
 }
 
 void startDrum(int note, int vel, uint32_t now) {
@@ -221,10 +248,10 @@ void rebalance() {
       if (n > nHi) { nHi = n; hi = b; }
       if (n < nLo) { nLo = n; lo = b; }
     }
-    if (nHi - nLo < 2) return;
     int mv = -1;
     for (int i = 0; i < nVoices; i++)
       if (voices[i].buz == hi && (mv < 0 || voices[i].on > voices[mv].on)) mv = i;
+    if (mv < 0 || nHi - nLo <= 1 + chPri[voices[mv].ch]) return;   // moving wouldn't help
     voices[mv].buz = lo;
     voices[mv].played = false;
     dirtyB[hi] = dirtyB[lo] = true;
@@ -250,7 +277,7 @@ void noteOn(uint8_t ch, uint8_t note, uint8_t vel, uint32_t now) {
   }
   Voice& v = voices[nVoices++];
   v.note = note; v.ch = ch; v.vel = vel; v.snd = foldNote(note);
-  v.played = false; v.on = now;
+  v.played = false; v.on = now; v.acc = 0;
   v.buz = -1;
   v.buz = leastLoadedBuzzer();
   dirtyB[v.buz] = true;
@@ -277,7 +304,8 @@ void arpStep(int b) {
   int maxN = cfgMaxNotes;
   if (maxN < 1) maxN = 1;
 
-  // Priority order: highest (melody), lowest (bass), then loudest / newest.
+  // Priority order: the melody first (highest priority class, then highest pitch),
+  // then by priority; within a class the bass comes next, then loudest / newest.
   int order[MAX_VOICES], m = 0;
   bool used[MAX_VOICES] = {};
   auto take = [&](int k) {
@@ -286,22 +314,23 @@ void arpStep(int b) {
       if (voices[order[j]].snd == voices[idx[k]].snd) return;   // same pitch: no extra slot
     order[m++] = idx[k];
   };
+  auto pri = [&](int k) { return (int)chPri[voices[idx[k]].ch]; };
 
-  int hi = 0, lo = 0;
+  int hi = 0;
   for (int k = 1; k < n; k++) {
-    if (voices[idx[k]].snd > voices[idx[hi]].snd) hi = k;
-    if (voices[idx[k]].snd < voices[idx[lo]].snd) lo = k;
+    if (pri(k) > pri(hi) || (pri(k) == pri(hi) && voices[idx[k]].snd > voices[idx[hi]].snd)) hi = k;
   }
   take(hi);
-  if (m < maxN && !used[lo]) take(lo);
   while (m < maxN) {
     int best = -1;
     for (int k = 0; k < n; k++) {
       if (used[k]) continue;
+      if (best < 0) { best = k; continue; }
+      if (pri(k) != pri(best)) { if (pri(k) > pri(best)) best = k; continue; }
       const Voice& a = voices[idx[k]];
-      if (best < 0 || a.vel > voices[idx[best]].vel ||
-          (a.vel == voices[idx[best]].vel && a.on > voices[idx[best]].on))
-        best = k;
+      const Voice& c = voices[idx[best]];
+      if (m == 1) { if (a.snd < c.snd) best = k; continue; }   // bass slot
+      if (a.vel > c.vel || (a.vel == c.vel && a.on > c.on)) best = k;
     }
     if (best < 0) break;
     take(best);
@@ -313,22 +342,26 @@ void arpStep(int b) {
     if (!voices[order[k]].played) { pick = order[k]; break; }
   }
   if (pick < 0) {
-    int k;
-    if (cfgBoost && m >= 3) {
-      // M B M i3 M i4 ... : melody on every other slot
-      int len = 2 * (m - 1), s = arpIdxB[b] % len;
-      k = (s % 2 == 0) ? 0 : 1 + s / 2;
-    } else {
-      k = arpIdxB[b] % m;
+    // Smooth weighted round robin: weight = 1 + priority; with melody weight on,
+    // the melody note gets half of all slots (M B M i3 M i4 ...).
+    int w[MAX_VOICES], total = 0;
+    for (int k = 0; k < m; k++) { w[k] = 1 + chPri[voices[order[k]].ch]; total += w[k]; }
+    if (cfgBoost && m >= 2) {
+      int others = total - w[0];
+      if (w[0] < others) { total += others - w[0]; w[0] = others; }
     }
-    pick = order[k];
+    int bestK = 0;
+    for (int k = 0; k < m; k++) {
+      voices[order[k]].acc += w[k];
+      if (voices[order[k]].acc > voices[order[bestK]].acc) bestK = k;
+    }
+    voices[order[bestK]].acc -= total;
+    pick = order[bestK];
   }
-  arpIdxB[b]++;
 
   Voice& v = voices[pick];
   v.played = true;
-  int duty = cfgDyn ? (int)(FULL_DUTY * (0.35f + 0.65f * v.vel / 15.0f)) : FULL_DUTY;
-  setTone(b, hz[v.snd], duty);
+  setTone(b, hz[v.snd], dutyFor(v.ch, v.vel));
 }
 
 void silenceAll() {
@@ -414,7 +447,7 @@ void tick() {
     } else {
       int f = drum.noise ? (int)random(drum.lo, drum.hi)
                          : drum.f0 + (int)((int32_t)(drum.f1 - drum.f0) * (int32_t)el / (int32_t)drum.len);
-      setTone(drum.buz, f, FULL_DUTY);
+      setTone(drum.buz, f, dutyFor(9, 15));
     }
   }
 
@@ -524,6 +557,16 @@ void handleCfg() {
   server.send(200, "text/plain", "ok");
 }
 
+void handleChan() {
+  if (server.hasArg("reset")) resetChannels();
+  if (server.hasArg("c")) {
+    int c = constrain(server.arg("c").toInt(), 0, 15);
+    if (server.hasArg("pri")) chPri[c] = constrain(server.arg("pri").toInt(), 0, 3);
+    if (server.hasArg("vol")) chVol[c] = constrain(server.arg("vol").toInt(), 10, 100);
+  }
+  server.send(200, "text/plain", "ok");
+}
+
 const char* wlStatusName(wl_status_t st) {
   switch (st) {
     case WL_IDLE_STATUS:     return "IDLE";
@@ -615,6 +658,7 @@ void setup() {
   Serial.printf("[sys] free heap %u, max alloc %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   for (int n = 0; n < 128; n++) hz[n] = (int)(440.0 * pow(2.0, (n - 69) / 12.0) + 0.5);
 
+  resetChannels();
   initBuzzers();
 
   playerMux = xSemaphoreCreateMutex();
@@ -625,6 +669,7 @@ void setup() {
   server.on("/upload", HTTP_POST, handleUploadDone, handleUpload);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/cfg", HTTP_GET, handleCfg);
+  server.on("/chan", HTTP_GET, handleChan);
   server.on("/play", HTTP_POST, []() {
     xSemaphoreTake(playerMux, portMAX_DELAY);
     startPlayback();

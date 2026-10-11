@@ -23,6 +23,10 @@ button.sec{background:#323843;color:var(--fg)}
 .ch{display:flex;align-items:center;gap:8px;padding:3px 0}
 .sw{width:12px;height:12px;border-radius:3px;flex:none}
 .ch small,.hint{color:var(--dim)}
+.ch .grow{flex:1;min-width:0}
+.ch select{background:#101216;color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:2px 4px}
+.ch input[type=range]{width:90px}
+.ch .vol{width:34px;text-align:right;font-size:12.5px;color:var(--dim)}
 .set{display:grid;grid-template-columns:1fr 1fr;gap:10px 22px}
 @media(max-width:640px){.set{grid-template-columns:1fr}}
 .set label{display:block}
@@ -171,7 +175,7 @@ function encodeSong(song,enabled){
 }
 //--MIDI-END
 
-let song=null,enabled={},cap=1e9,playing=false,lastLen=0;
+let song=null,chSet={},enabled={},cap=1e9,playing=false,lastLen=0;
 
 function msg(t,err){const m=$('msg');m.textContent=t;m.className=err?'err':'';}
 const col=ch=>ch===9?'#9aa0a6':`hsl(${(ch*47)%360} 70% 60%)`;
@@ -202,15 +206,31 @@ function drawChans(){
     const lab=document.createElement('span');
     const what=ch===9?'Drums':(FAM[c.program>>3]||'?');
     lab.innerHTML=`Ch ${ch+1} &middot; ${what} <small>${c.name?'&ldquo;'+c.name.replace(/</g,'&lt;')+'&rdquo; &middot; ':''}${c.count} notes${ch===9?'':' &middot; '+nn(c.lo)+'&ndash;'+nn(c.hi)}</small>`;
-    row.append(cb,sw,lab);box.append(row);
+    lab.className='grow';
+    const st=chSet[ch]||(chSet[ch]={pri:1,vol:100});
+    const sel=document.createElement('select');sel.title='Priority: who gets the melody slots / their own buzzer';
+    ['Background','Normal','High','Lead'].forEach((t,i)=>{const o=document.createElement('option');o.value=i;o.textContent=t;sel.append(o);});
+    sel.value=st.pri;
+    const vol=document.createElement('input');vol.type='range';vol.min=10;vol.max=100;vol.step=5;vol.value=st.vol;vol.title='Volume (PWM duty)';
+    const vl=document.createElement('span');vl.className='vol';vl.textContent=st.vol+'%';
+    sel.onchange=()=>{st.pri=+sel.value;pushChan(ch);};
+    vol.oninput=()=>{st.vol=+vol.value;vl.textContent=st.vol+'%';pushChan(ch);};
+    row.append(cb,sw,lab,sel,vol,vl);box.append(row);
   }
+}
+
+const chT={};
+function pushChan(ch){
+  clearTimeout(chT[ch]);
+  chT[ch]=setTimeout(()=>fetch(`/chan?c=${ch}&pri=${chSet[ch].pri}&vol=${chSet[ch].vol}`).catch(()=>{}),120);
 }
 
 async function loadFile(f){
   try{
     song=parseMidi(await f.arrayBuffer());
   }catch(e){msg('Could not read MIDI: '+e.message,true);return;}
-  enabled={};for(const ch in song.chans)enabled[ch]=true;
+  enabled={};chSet={};for(const ch in song.chans)enabled[ch]=true;
+  fetch('/chan?reset=1').catch(()=>{});
   $('song').hidden=false;$('sname').textContent=f.name;
   $('sinfo').textContent=`${fmt(song.length)} · ${song.notes.length} notes`;
   drawChans();drawRoll();
