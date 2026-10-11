@@ -15,7 +15,11 @@
 //   * synthetic drums  - kick = pitch sweep, snare/hat/cymbal = noise bursts
 //   * dynamics         - velocity -> PWM duty (narrower pulse = quieter)
 //
-// Needs Arduino-ESP32 core 3.x (ledcAttach / ledcWriteTone).
+//   * multi-buzzer     - with several buzzers (BUZZER_PINS) notes are spread
+//                        over them (sticky, least-loaded first); only when there
+//                        are more notes than buzzers do they share by arpeggio
+//
+// Needs Arduino-ESP32 core 3.x (raw LEDC driver, 4 timers on the C3).
 //
 // Event stream (built by the web page), 4 bytes per event:
 //   u16 LE  delta ms since previous event
@@ -27,6 +31,7 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <esp_timer.h>
+#include <driver/ledc.h>
 #include "index_html.h"
 
 // ---------- configuration ----------
@@ -38,8 +43,12 @@ const char* AP_PASS = "buzzer123";
 const uint32_t WIFI_TIMEOUT_MS = 15000;
 const wifi_power_t WIFI_TX_POWER = WIFI_POWER_8_5dBm;   // try WIFI_POWER_19_5dBm if signal is weak
 
-const int BUZZER_PIN = 10;
-const int FULL_DUTY = 512;       // 50% of the 10-bit range used by ledcWriteTone
+// One entry per buzzer, each on its own GPIO (through its own resistor / transistor).
+// The ESP32-C3 has 4 independent LEDC timers, so at most 4 buzzers can play different pitches.
+// The web page can use fewer than this at runtime. Avoid strapping pins (2, 8, 9).
+const int BUZZER_PINS[] = {10, 3, 4, 5};
+const int NUM_BUZZERS = sizeof(BUZZER_PINS) / sizeof(BUZZER_PINS[0]);
+const int FULL_DUTY = 512;       // 50% of the 10-bit range
 const int MAX_VOICES = 24;
 const int MIN_HZ_NOTE = 40;      // ~82 Hz: LEDC can't go much lower at 10 bit
 const int MAX_HZ_NOTE = 108;
@@ -48,7 +57,8 @@ const size_t HEAP_RESERVE = 28 * 1024;  // left free for WiFi/web server when al
 
 // ---------- live settings (set from the web page) ----------
 volatile int cfgArpMs = 20;      // arpeggio step
-volatile int cfgMaxNotes = 4;    // notes taking part in the arpeggio
+volatile int cfgMaxNotes = 4;    // notes taking part in the arpeggio, per buzzer
+volatile int cfgBuzzers = NUM_BUZZERS;   // buzzers in use
 volatile int cfgMinNote = 48;    // fold anything lower up by octaves
 volatile bool cfgBoost = true;   // melody weight
 volatile bool cfgDrums = true;
@@ -74,17 +84,20 @@ struct Voice {
   uint8_t ch;
   uint8_t vel;                   // 1..15
   uint8_t snd;                   // note actually sounded after octave folding
+  int8_t buz;                    // buzzer this voice lives on
   bool played;                   // has had its attack slot yet
   uint32_t on;
 };
 Voice voices[MAX_VOICES];
 int nVoices = 0;
-bool dirty = false;              // note set changed -> re-evaluate output right now
-uint32_t nextArp = 0;
-uint32_t arpIdx = 0;
+int activeBuz = NUM_BUZZERS;
+bool dirtyB[NUM_BUZZERS];        // note set on this buzzer changed -> re-evaluate right now
+uint32_t nextArpB[NUM_BUZZERS];
+uint32_t arpIdxB[NUM_BUZZERS];
 
 struct Drum {
   bool active;
+  int buz;
   uint32_t start, len;
   int f0, f1;                    // sweep start / end Hz
   bool noise;
@@ -92,28 +105,51 @@ struct Drum {
 } drum;
 
 int hz[128];
-int curFreq = -1, curDuty = -1;
+int curFreq[NUM_BUZZERS], curDuty[NUM_BUZZERS];
 
 WebServer server(80);
 
-// ---------- buzzer ----------
-void setTone(int f, int duty) {
+// ---------- buzzers (raw LEDC: buzzer b = timer b + channel b, all independent) ----------
+void initBuzzers() {
+  for (int b = 0; b < NUM_BUZZERS; b++) {
+    ledc_timer_config_t t = {};
+    t.speed_mode = LEDC_LOW_SPEED_MODE;
+    t.duty_resolution = LEDC_TIMER_10_BIT;
+    t.timer_num = (ledc_timer_t)b;
+    t.freq_hz = 1000;
+    t.clk_cfg = LEDC_AUTO_CLK;
+    esp_err_t e1 = ledc_timer_config(&t);
+    ledc_channel_config_t c = {};
+    c.gpio_num = BUZZER_PINS[b];
+    c.speed_mode = LEDC_LOW_SPEED_MODE;
+    c.channel = (ledc_channel_t)b;
+    c.timer_sel = (ledc_timer_t)b;
+    c.duty = 0;
+    esp_err_t e2 = ledc_channel_config(&c);
+    curFreq[b] = 0;
+    curDuty[b] = 0;
+    Serial.printf("[buzzer] #%d on GPIO%d: timer %s, channel %s\n", b, BUZZER_PINS[b],
+                  e1 == ESP_OK ? "ok" : "FAILED", e2 == ESP_OK ? "ok" : "FAILED");
+  }
+}
+
+void setTone(int b, int f, int duty) {
   if (f <= 0 || duty <= 0) {
-    if (curFreq != 0) {
-      ledcWrite(BUZZER_PIN, 0);
-      curFreq = 0;
-      curDuty = 0;
+    if (curDuty[b] != 0) {
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)b, 0);
+      ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)b);
+      curDuty[b] = 0;
     }
     return;
   }
-  if (f != curFreq) {
-    ledcWriteTone(BUZZER_PIN, f);   // also sets 50% duty
-    curFreq = f;
-    curDuty = FULL_DUTY;
+  if (f != curFreq[b]) {
+    ledc_set_freq(LEDC_LOW_SPEED_MODE, (ledc_timer_t)b, f);
+    curFreq[b] = f;
   }
-  if (duty != curDuty) {
-    ledcWrite(BUZZER_PIN, duty);
-    curDuty = duty;
+  if (duty != curDuty[b]) {
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)b, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)b);
+    curDuty[b] = duty;
   }
 }
 
@@ -125,7 +161,21 @@ int foldNote(int n) {
 }
 
 // ---------- drums ----------
+int voicesOn(int b) {
+  int n = 0;
+  for (int i = 0; i < nVoices; i++) n += voices[i].buz == b;
+  return n;
+}
+
 void startDrum(int note, int vel, uint32_t now) {
+  if (drum.active) dirtyB[drum.buz] = true;     // hand the previous drum's buzzer back
+  // the drum takes the buzzer with the fewest notes (the last one on a tie)
+  int best = 0, bestN = 1000;
+  for (int b = 0; b < activeBuz; b++) {
+    int n = voicesOn(b);
+    if (n <= bestN) { bestN = n; best = b; }
+  }
+  drum.buz = best;
   drum.active = true;
   drum.start = now;
   drum.noise = false;
@@ -151,6 +201,36 @@ void startDrum(int note, int vel, uint32_t now) {
 }
 
 // ---------- voices ----------
+// Each voice lives on one buzzer (sticky, so sustained notes don't hop around).
+// A buzzer with several voices time-slices them with the arpeggio.
+int leastLoadedBuzzer() {
+  int best = 0, bestN = 1000;
+  for (int b = 0; b < activeBuz; b++) {
+    int n = voicesOn(b);
+    if (n < bestN) { bestN = n; best = b; }
+  }
+  return best;
+}
+
+// After notes end, move a recent voice from the busiest buzzer to the emptiest one.
+void rebalance() {
+  for (int pass = 0; pass < activeBuz; pass++) {
+    int hi = 0, lo = 0, nHi = -1, nLo = 1000;
+    for (int b = 0; b < activeBuz; b++) {
+      int n = voicesOn(b);
+      if (n > nHi) { nHi = n; hi = b; }
+      if (n < nLo) { nLo = n; lo = b; }
+    }
+    if (nHi - nLo < 2) return;
+    int mv = -1;
+    for (int i = 0; i < nVoices; i++)
+      if (voices[i].buz == hi && (mv < 0 || voices[i].on > voices[mv].on)) mv = i;
+    voices[mv].buz = lo;
+    voices[mv].played = false;
+    dirtyB[hi] = dirtyB[lo] = true;
+  }
+}
+
 void removeVoice(int i) {
   for (int k = i; k < nVoices - 1; k++) voices[k] = voices[k + 1];
   nVoices--;
@@ -160,30 +240,39 @@ void noteOn(uint8_t ch, uint8_t note, uint8_t vel, uint32_t now) {
   for (int i = 0; i < nVoices; i++) {
     if (voices[i].ch == ch && voices[i].note == note) {   // retrigger
       voices[i].vel = vel; voices[i].played = false; voices[i].on = now;
-      dirty = true;
+      dirtyB[voices[i].buz] = true;
       return;
     }
   }
-  if (nVoices >= MAX_VOICES) removeVoice(0);              // drop the oldest
+  if (nVoices >= MAX_VOICES) {                            // drop the oldest
+    dirtyB[voices[0].buz] = true;
+    removeVoice(0);
+  }
   Voice& v = voices[nVoices++];
   v.note = note; v.ch = ch; v.vel = vel; v.snd = foldNote(note);
   v.played = false; v.on = now;
-  dirty = true;
+  v.buz = -1;
+  v.buz = leastLoadedBuzzer();
+  dirtyB[v.buz] = true;
 }
 
 void noteOff(uint8_t ch, uint8_t note) {
   for (int i = 0; i < nVoices; i++) {
     if (voices[i].ch == ch && voices[i].note == note) {
+      dirtyB[voices[i].buz] = true;
       removeVoice(i);
-      dirty = true;
+      rebalance();
       return;
     }
   }
 }
 
-// Pick which active note the buzzer sounds for this arpeggio slot.
-void arpStep() {
-  if (nVoices == 0) { setTone(0, 0); return; }
+// Pick which of buzzer b's notes sounds for this arpeggio slot.
+void arpStep(int b) {
+  int idx[MAX_VOICES], n = 0;
+  for (int i = 0; i < nVoices; i++)
+    if (voices[i].buz == b) idx[n++] = i;
+  if (n == 0) { setTone(b, 0, 0); return; }
 
   int maxN = cfgMaxNotes;
   if (maxN < 1) maxN = 1;
@@ -191,27 +280,28 @@ void arpStep() {
   // Priority order: highest (melody), lowest (bass), then loudest / newest.
   int order[MAX_VOICES], m = 0;
   bool used[MAX_VOICES] = {};
-  auto take = [&](int i) {
-    used[i] = true;
-    for (int k = 0; k < m; k++)
-      if (voices[order[k]].snd == voices[i].snd) return;    // same pitch: no extra slot
-    order[m++] = i;
+  auto take = [&](int k) {
+    used[k] = true;
+    for (int j = 0; j < m; j++)
+      if (voices[order[j]].snd == voices[idx[k]].snd) return;   // same pitch: no extra slot
+    order[m++] = idx[k];
   };
 
   int hi = 0, lo = 0;
-  for (int i = 1; i < nVoices; i++) {
-    if (voices[i].snd > voices[hi].snd) hi = i;
-    if (voices[i].snd < voices[lo].snd) lo = i;
+  for (int k = 1; k < n; k++) {
+    if (voices[idx[k]].snd > voices[idx[hi]].snd) hi = k;
+    if (voices[idx[k]].snd < voices[idx[lo]].snd) lo = k;
   }
   take(hi);
   if (m < maxN && !used[lo]) take(lo);
   while (m < maxN) {
     int best = -1;
-    for (int i = 0; i < nVoices; i++) {
-      if (used[i]) continue;
-      if (best < 0 || voices[i].vel > voices[best].vel ||
-          (voices[i].vel == voices[best].vel && voices[i].on > voices[best].on))
-        best = i;
+    for (int k = 0; k < n; k++) {
+      if (used[k]) continue;
+      const Voice& a = voices[idx[k]];
+      if (best < 0 || a.vel > voices[idx[best]].vel ||
+          (a.vel == voices[idx[best]].vel && a.on > voices[idx[best]].on))
+        best = k;
     }
     if (best < 0) break;
     take(best);
@@ -226,26 +316,28 @@ void arpStep() {
     int k;
     if (cfgBoost && m >= 3) {
       // M B M i3 M i4 ... : melody on every other slot
-      int len = 2 * (m - 1), s = arpIdx % len;
+      int len = 2 * (m - 1), s = arpIdxB[b] % len;
       k = (s % 2 == 0) ? 0 : 1 + s / 2;
     } else {
-      k = arpIdx % m;
+      k = arpIdxB[b] % m;
     }
     pick = order[k];
   }
-  arpIdx++;
+  arpIdxB[b]++;
 
   Voice& v = voices[pick];
   v.played = true;
   int duty = cfgDyn ? (int)(FULL_DUTY * (0.35f + 0.65f * v.vel / 15.0f)) : FULL_DUTY;
-  setTone(hz[v.snd], duty);
+  setTone(b, hz[v.snd], duty);
 }
 
 void silenceAll() {
   nVoices = 0;
   drum.active = false;
-  dirty = false;
-  setTone(0, 0);
+  for (int b = 0; b < NUM_BUZZERS; b++) {
+    dirtyB[b] = false;
+    setTone(b, 0, 0);
+  }
 }
 
 // ---------- player ----------
@@ -272,8 +364,7 @@ void rewind() {
   silenceAll();
   evIdx = 0;
   evTime = songEvents ? dtAt(0) : 0;
-  arpIdx = 0;
-  nextArp = 0;
+  for (int b = 0; b < NUM_BUZZERS; b++) { arpIdxB[b] = 0; nextArpB[b] = 0; }
   t0Us = esp_timer_get_time();
   posMs = 0;
 }
@@ -295,6 +386,14 @@ void tick() {
   uint32_t now = (uint32_t)((esp_timer_get_time() - t0Us) / 1000);
   posMs = now;
 
+  if (activeBuz != cfgBuzzers) {                            // buzzer count changed from the web page
+    int nb = constrain((int)cfgBuzzers, 1, NUM_BUZZERS);
+    for (int b = 0; b < NUM_BUZZERS; b++) { setTone(b, 0, 0); dirtyB[b] = true; }
+    activeBuz = nb;
+    if (drum.active && drum.buz >= nb) drum.active = false;
+    for (int i = 0; i < nVoices; i++) { voices[i].buz = -1; voices[i].buz = leastLoadedBuzzer(); voices[i].played = false; }
+  }
+
   while (evIdx < songEvents && evTime <= now) {
     applyEvent(evIdx, now);
     evIdx++;
@@ -311,19 +410,21 @@ void tick() {
     uint32_t el = now - drum.start;
     if (el >= drum.len) {
       drum.active = false;
-      dirty = true;                                         // hand the buzzer back to the melody
+      dirtyB[drum.buz] = true;                              // hand the buzzer back to the melody
     } else {
       int f = drum.noise ? (int)random(drum.lo, drum.hi)
                          : drum.f0 + (int)((int32_t)(drum.f1 - drum.f0) * (int32_t)el / (int32_t)drum.len);
-      setTone(f, FULL_DUTY);
-      return;
+      setTone(drum.buz, f, FULL_DUTY);
     }
   }
 
-  if (dirty || now >= nextArp) {
-    dirty = false;
-    nextArp = now + cfgArpMs;
-    arpStep();
+  for (int b = 0; b < activeBuz; b++) {
+    if (drum.active && drum.buz == b) continue;
+    if (dirtyB[b] || now >= nextArpB[b]) {
+      dirtyB[b] = false;
+      nextArpB[b] = now + cfgArpMs;
+      arpStep(b);
+    }
   }
 }
 
@@ -400,7 +501,8 @@ void handleStatus() {
   s += ",\"pos\":" + String(posMs);
   s += ",\"len\":" + String(songLenMs);
   s += ",\"events\":" + String(songEvents);
-  s += ",\"cap\":" + String(cap) + "}";
+  s += ",\"cap\":" + String(cap);
+  s += ",\"nbmax\":" + String(NUM_BUZZERS) + ",\"nb\":" + String((int)cfgBuzzers) + "}";
   server.send(200, "application/json", s);
 }
 
@@ -413,6 +515,7 @@ void handleCfg() {
   };
   clampArg("arp", 4, 100, cfgArpMs);
   clampArg("maxn", 1, 8, cfgMaxNotes);
+  clampArg("nbuz", 1, NUM_BUZZERS, cfgBuzzers);
   clampArg("minn", MIN_HZ_NOTE, 72, cfgMinNote);
   boolArg("boost", cfgBoost);
   boolArg("drums", cfgDrums);
@@ -512,9 +615,7 @@ void setup() {
   Serial.printf("[sys] free heap %u, max alloc %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   for (int n = 0; n < 128; n++) hz[n] = (int)(440.0 * pow(2.0, (n - 69) / 12.0) + 0.5);
 
-  ledcAttach(BUZZER_PIN, 1000, 10);
-  ledcWrite(BUZZER_PIN, 0);
-  curFreq = 0;
+  initBuzzers();
 
   playerMux = xSemaphoreCreateMutex();
   connectWiFi();
