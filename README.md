@@ -8,6 +8,10 @@ DOS and C64 games used to fake chords: fast arpeggios, melody priority,
 synthetic drums. With several buzzers the notes are spread across them, so
 most music needs very little arpeggiating.
 
+Example video: https://www.youtube.com/watch?v=nxFR9ha6JAU
+
+<img width="931" height="948" alt="image" src="https://github.com/user-attachments/assets/ef266fe5-9d9d-4d45-a98a-b221c5b624ef" />
+
 ## What you need
 
 - ESP32-C3 board (developed on an ESP32-C3-Zero)
